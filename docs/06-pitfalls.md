@@ -124,6 +124,24 @@ self._send(200, json.dumps({"ok": True, "output": out}))
 text = raw.decode(...).replace("\r", "").replace("esp32> ", "")
 ```
 
+## 9. `Pin.value(1)` возвращает `None`
+
+**Симптом.** `esp32.gpio(10, "out", 1)` печатает `gpio 10 = None`, хотя LED загорается.
+
+**Причина.** В MicroPython сеттер `Pin.value(v)` ничего не возвращает. Обёртка возвращала результат сеттера.
+
+**Решение.** Выставить и вернуть значение явно:
+
+```python
+def pin(num, mode):
+    p = machine.Pin(int(num), machine.Pin.IN if mode == "in" else machine.Pin.OUT)
+    if mode == "in":
+        return p.value()
+    v = 1 if mode in ("1", "on", "high") else 0
+    p.value(v)
+    return v
+```
+
 ## Бонус: почему панель — владелец порта
 
 Открытие/закрытие `serial.Serial` на каждый запрос — источник гонок и потерь. Один долгоживущий владелец + очередь + `pause/resume` для прошивки оказались единственной схемой, которая стабильно держит 5 Гц телеметрии и параллельный `mpremote`.

@@ -7,14 +7,20 @@ Open: http://127.0.0.1:8770
 The dashboard owns the UART for its whole lifetime (a single worker thread),
 which avoids byte loss from open/close churn. Other processes (opencode MCP)
 go through POST /api/cmd instead of opening the port themselves.
+
+Logs:
+  $XDG_STATE_HOME/esp32-dashboard/events.jsonl   structured host events
+  $XDG_STATE_HOME/esp32-dashboard/recordings/    IMU CSV recordings
 """
 import json
+import math
 import os
 import queue
 import re
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +33,13 @@ for _cand in (os.path.join(HERE, "..", "mcp"), os.path.expanduser("~/.config/ope
 import esp_common as ec  # noqa: E402
 
 PORT = int(os.environ.get("DASH_PORT", "8770"))
+STATE_DIR = os.environ.get(
+    "ESP32_STATE_DIR", os.path.expanduser("~/.local/state/esp32-dashboard")
+)
+EVENTS_LOG = os.path.join(STATE_DIR, "events.jsonl")
+REC_DIR = os.path.join(STATE_DIR, "recordings")
+WEBHOOK = os.environ.get("ESP32_WEBHOOK", "")
+os.makedirs(REC_DIR, exist_ok=True)
 
 SAMPLE = "sample"
 
@@ -44,15 +57,73 @@ STATE = {
     "score": 0.0,
     "wifi": [],
     "events": [],
+    "recording": False,
+    "last_recording": None,
+    "host_uptime": 0,
 }
 SLOCK = threading.Lock()
+FLOCK = threading.Lock()
 CFG = {"threshold": 0.06}
+STARTED = time.time()
 
 
-def log_event(text):
+def _append_jsonl(path, entry):
+    try:
+        with FLOCK:
+            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+                os.replace(path, path + ".1")
+            with open(path, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _read_jsonl_tail(path, n=100):
+    try:
+        with open(path) as f:
+            lines = f.readlines()[-n:]
+        return [json.loads(line) for line in lines if line.strip()]
+    except Exception:
+        return []
+
+
+def log_event(text, kind="info", **extra):
+    entry = {
+        "ts": time.time(),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "kind": kind,
+        "text": text,
+    }
+    entry.update(extra)
     with SLOCK:
-        STATE["events"].insert(0, {"t": time.strftime("%H:%M:%S"), "text": text})
-        del STATE["events"][60:]
+        STATE["events"].insert(0, {"t": time.strftime("%H:%M:%S"), "text": text, "kind": kind})
+        del STATE["events"][80:]
+    _append_jsonl(EVENTS_LOG, entry)
+    if WEBHOOK and kind in ("motion", "button"):
+        _notify(dict(entry, event=kind))
+
+
+def _notify(payload):
+    def go():
+        try:
+            req = urllib.request.Request(
+                WEBHOOK,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as e:
+            _append_jsonl(
+                EVENTS_LOG,
+                {
+                    "ts": time.time(),
+                    "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "kind": "error",
+                    "text": "webhook failed: %s" % e,
+                },
+            )
+
+    threading.Thread(target=go, daemon=True).start()
 
 
 class Worker(threading.Thread):
@@ -64,10 +135,10 @@ class Worker(threading.Thread):
         self.ser = None
         self.paused_until = 0.0
         self.last_acc = None
+        self.last_btn = None
         self.score = 0.0
         self.fail = 0
 
-    # -- plumbing ---------------------------------------------------------
     def _open(self):
         self.ser = ec._open()
         ec.sync(self.ser)
@@ -83,7 +154,7 @@ class Worker(threading.Thread):
     def pause(self, seconds=20.0):
         self.paused_until = time.time() + seconds
         self._close()
-        time.sleep(0.4)  # let an in-flight write settle
+        time.sleep(0.4)
 
     def resume(self):
         self.paused_until = 0.0
@@ -99,7 +170,6 @@ class Worker(threading.Thread):
         return ec.clean(raw, command)
 
     def exec(self, command, timeout=10.0):
-        """Run a command synchronously from a request thread."""
         if self.paused_until > time.time():
             raise RuntimeError("port paused for flashing")
         fut = {"ev": threading.Event(), "out": None, "err": None}
@@ -110,7 +180,6 @@ class Worker(threading.Thread):
             raise fut["err"]
         return fut["out"]
 
-    # -- main loop --------------------------------------------------------
     def run(self):
         while True:
             if self.paused_until > time.time():
@@ -135,7 +204,7 @@ class Worker(threading.Thread):
             if len(parts) < 13:
                 self.fail += 1
                 if self.fail in (1, 10, 100):
-                    log_event("bad sample (%d): %r" % (self.fail, raw[:60]))
+                    log_event("bad sample (%d): %r" % (self.fail, raw[:60]), kind="error")
                 time.sleep(0.3)
                 return
             self.fail = 0
@@ -147,7 +216,7 @@ class Worker(threading.Thread):
                 return
             with SLOCK:
                 STATE["online"] = False
-            log_event("serial error: %s" % e)
+            log_event("serial error: %s" % e, kind="error")
             time.sleep(0.5)
             return
 
@@ -158,6 +227,7 @@ class Worker(threading.Thread):
             self.score = self.score * 0.75 + jerk * 0.25
         self.last_acc = acc
         moving = self.score > CFG["threshold"]
+        btn = [int(vals[10]), int(vals[11])]
 
         with SLOCK:
             was = STATE["motion"]
@@ -169,13 +239,20 @@ class Worker(threading.Thread):
                 pct=int(vals[7]),
                 charge=vals[8],
                 load=vals[9],
-                btn=[int(vals[10]), int(vals[11])],
+                btn=btn,
                 uptime=int(vals[12]),
                 motion=moving,
                 score=round(self.score, 4),
+                host_uptime=int(time.time() - STARTED),
             )
+
         if moving and not was:
-            log_event("motion detected (%.2f g/s)" % self.score)
+            log_event("motion detected (%.2f g/s)" % self.score, kind="motion", score=round(self.score, 4))
+        if self.last_btn is not None and btn != self.last_btn:
+            for name, old, new in (("A", self.last_btn[0], btn[0]), ("B", self.last_btn[1], btn[1])):
+                if old != new:
+                    log_event("button %s %s" % (name, "pressed" if new == 0 else "released"), kind="button", button=name)
+        self.last_btn = btn
 
 
 WORKER = Worker()
@@ -193,11 +270,55 @@ def wifi_scan():
                 )
         with SLOCK:
             STATE["wifi"] = nets[:30]
-        log_event("wifi scan: %d networks" % len(nets))
+        log_event("wifi scan: %d networks" % len(nets), kind="wifi")
         return nets
     except Exception as e:
-        log_event("wifi scan failed: %s" % e)
+        log_event("wifi scan failed: %s" % e, kind="error")
         return []
+
+
+def record(seconds=10):
+    seconds = max(1, min(120, int(seconds)))
+    name = time.strftime("imu-%Y%m%d-%H%M%S.csv")
+    path = os.path.join(REC_DIR, name)
+    rows = 0
+    mags = []
+    with SLOCK:
+        STATE["recording"] = True
+    t0 = time.time()
+    try:
+        with open(path, "w") as f:
+            f.write("t,ax,ay,az,gx,gy,gz,volts,pct,btnA,btnB\n")
+            while time.time() - t0 < seconds:
+                with SLOCK:
+                    s = dict(STATE)
+                    imu = list(s["imu"])
+                if s["online"]:
+                    t = time.time() - t0
+                    f.write(
+                        "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%d,%d,%d\n"
+                        % (t, imu[0], imu[1], imu[2], imu[3], imu[4], imu[5], s["volts"], s["pct"], s["btn"][0], s["btn"][1])
+                    )
+                    mags.append(math.sqrt(imu[0] ** 2 + imu[1] ** 2 + imu[2] ** 2))
+                    rows += 1
+                time.sleep(0.2)
+    finally:
+        with SLOCK:
+            STATE["recording"] = False
+
+    summary = {"rows": rows, "seconds": round(time.time() - t0, 1)}
+    if mags:
+        summary.update(
+            mean_g=round(sum(mags) / len(mags), 3),
+            min_g=round(min(mags), 3),
+            max_g=round(max(mags), 3),
+            spread_g=round(max(mags) - min(mags), 3),
+        )
+    result = {"path": path, "name": name, **summary}
+    with SLOCK:
+        STATE["last_recording"] = result
+    log_event("recording %s: %d rows, spread %s g" % (name, rows, summary.get("spread_g")), kind="record", path=path, rows=rows)
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -216,7 +337,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 body = f.read()
             self.send_response(200)
@@ -224,12 +346,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/state":
+        elif path == "/api/state":
             with SLOCK:
                 self._json(200, STATE)
-        elif self.path == "/api/ping":
-            self._json(200, {"ok": True, "port": ec.PORT})
-        elif self.path == "/events":
+        elif path == "/api/ping":
+            self._json(200, {"ok": True, "port": ec.PORT, "state_dir": STATE_DIR, "webhook": bool(WEBHOOK)})
+        elif path == "/api/logs":
+            n = 100
+            if "n=" in self.path:
+                try:
+                    n = int(self.path.split("n=")[1].split("&")[0])
+                except Exception:
+                    pass
+            self._json(200, {"entries": _read_jsonl_tail(EVENTS_LOG, max(1, min(1000, n)))})
+        elif path == "/api/device-log":
+            n = 50
+            if "n=" in self.path:
+                try:
+                    n = int(self.path.split("n=")[1].split("&")[0])
+                except Exception:
+                    pass
+            try:
+                self._json(200, {"ok": True, "output": WORKER.exec("log %d" % max(1, min(200, n)), timeout=15)})
+            except Exception as e:
+                self._json(200, {"ok": False, "output": str(e)})
+        elif path == "/api/recordings":
+            items = []
+            for name in sorted(os.listdir(REC_DIR), reverse=True):
+                if not name.endswith(".csv"):
+                    continue
+                full = os.path.join(REC_DIR, name)
+                items.append({"name": name, "size": os.path.getsize(full), "mtime": os.path.getmtime(full)})
+            self._json(200, {"dir": REC_DIR, "items": items[:50]})
+        elif path == "/events":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -257,17 +406,28 @@ class Handler(BaseHTTPRequestHandler):
             cmd = (body.get("command") or "").strip()
             if not cmd:
                 return self._json(400, {"error": "empty command"})
+            t0 = time.time()
             try:
                 out = WORKER.exec(cmd, timeout=30)
-                self._json(200, {"ok": True, "output": out})
+                ms = int((time.time() - t0) * 1000)
+                if cmd != "sample":
+                    log_event("cmd: %s" % cmd, kind="cmd", ms=ms, ok=True)
+                self._json(200, {"ok": True, "output": out, "ms": ms})
             except Exception as e:
+                log_event("cmd failed: %s (%s)" % (cmd, e), kind="error")
                 self._json(200, {"ok": False, "output": str(e)})
         elif self.path == "/api/wifi":
             threading.Thread(target=wifi_scan, daemon=True).start()
             self._json(200, {"ok": True})
         elif self.path == "/api/motion":
             CFG["threshold"] = float(body.get("threshold", CFG["threshold"]))
+            log_event("motion threshold -> %.2f" % CFG["threshold"], kind="config")
             self._json(200, {"ok": True, "threshold": CFG["threshold"]})
+        elif self.path == "/api/record":
+            try:
+                self._json(200, {"ok": True, **record(body.get("seconds", 10))})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
         elif self.path == "/api/pause":
             WORKER.pause(float(body.get("seconds", 20)))
             self._json(200, {"ok": True})
@@ -281,6 +441,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     WORKER.start()
     threading.Timer(2.0, wifi_scan).start()
+    log_event("dashboard started on port %d" % PORT, kind="system", state_dir=STATE_DIR)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print("dashboard: http://127.0.0.1:%d" % PORT, flush=True)
     srv.serve_forever()

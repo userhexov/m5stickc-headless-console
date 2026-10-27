@@ -38,22 +38,19 @@ ESP32 умеет отдавать **Channel State Information** — амплит
 
 Без второго устройства можно сделать «эхо»-схему, но это уже исследовательский проект.
 
-## MQTT / webhooks
+## Webhooks (уже есть)
 
-Сейчас события живут только в панели. Следующий шаг — отдавать их наружу:
+Панель умеет отдавать события наружу. Задайте `ESP32_WEBHOOK`, и `motion`/`button` будут уходить POST-ом:
+
+```bash
+ESP32_WEBHOOK=http://127.0.0.1:9000/hook ./scripts/install-service.sh
+```
 
 ```json
-POST http://127.0.0.1:8770/api/cmd {"command": "..."}
+{"event": "motion", "kind": "motion", "text": "motion detected (0.12 g/s)", "score": 0.12}
 ```
 
-или добавить в панель исходящий webhook:
-
-```python
-if moving and not was:
-    requests.post(WEBHOOK, json={"event": "motion", "score": score})
-```
-
-Тогда автоматизации в Hyprland/Home Assistant собираются без участия человека.
+Готовые потребители: `scripts/presence_lock.py` (hyprlock), `scripts/macro_pad.py` (кнопки), Home Assistant через webhook-триггер. MQTT пока нет — при желании добавляется в `_notify()` панели.
 
 ## Что не нужно покупать
 

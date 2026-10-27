@@ -1,8 +1,12 @@
 # Headless M5StickC terminal shell
+import os
 import sys
 import time
 
 import stick
+
+LOG_PATH = "log.txt"
+LOG_MAX = 8192
 
 HELP = """commands:
   help                 this text
@@ -12,15 +16,26 @@ HELP = """commands:
   temp                 chip temperature
   imu [n]              n samples of accel/gyro (default 1)
   wifi                 scan 2.4 GHz networks
-  i2c                  scan i2c bus
+  wifi status          connection state / rssi / ip
+  wifi connect <ssid> <pass>
+  wifi off             disconnect
+  rssi <ssid>          rssi of one network (2 s scan)
+  i2c                  scan bus
+  i2c r <addr> <reg> [n]   read registers
+  i2c w <addr> <reg> <val> write register
   pins                 button states (A, B)
+  pin <gpio> in|0|1    read/write a gpio
+  adc <gpio>           raw + mV
+  pwm <gpio> off|freq duty
   led on|off|blink     red led
   buzz [hz] [ms]       beeper
+  melody               play a short tune
   cpu [mhz]            show/set cpu frequency
   uptime               seconds since boot
-  rssi <ssid>          rssi of one network (2 s scan)
-  melody               play a short tune
   bench                cpu benchmark
+  log [n]              last n log lines (default 30)
+  log clear            erase the log
+  deepsleep <sec>      deep sleep for n seconds
   py <code>            run a python one-liner (stick, time available)
   reboot               restart board
 """
@@ -28,6 +43,28 @@ HELP = """commands:
 
 def out(*a):
     print(*a)
+
+
+def _log(text):
+    """Append one line to the on-device ring log (8 KiB, one rotation)."""
+    try:
+        try:
+            size = os.stat(LOG_PATH)[6]
+        except OSError:
+            size = 0
+        if size > LOG_MAX:
+            try:
+                os.remove("log.1")
+            except OSError:
+                pass
+            try:
+                os.rename(LOG_PATH, "log.1")
+            except OSError:
+                pass
+        with open(LOG_PATH, "a") as f:
+            f.write("[%ds] %s\n" % (stick.uptime(), text))
+    except Exception:
+        pass
 
 
 def do_chip():
@@ -56,13 +93,53 @@ def do_imu(args):
             time.sleep_ms(200)
 
 
-def do_wifi():
+def do_wifi(args):
+    if args and args[0] == "status":
+        s = stick.wifi_status()
+        if not s.get("active"):
+            out("wifi: off")
+        elif not s.get("connected"):
+            out("wifi: on, not connected")
+        else:
+            out("ssid:", s["ssid"])
+            out("rssi:", s["rssi"], "dBm")
+            out("ip  :", s["ip"])
+        return
+    if args and args[0] == "connect":
+        if len(args) < 3:
+            out("usage: wifi connect <ssid> <password>")
+            return
+        ok = stick.wifi_connect(args[1], args[2])
+        out("connected" if ok else "failed")
+        return
+    if args and args[0] in ("off", "disconnect"):
+        stick.wifi_disconnect()
+        out("wifi off")
+        return
+
     nets = stick.wifi_scan()
     out("%-32s %4s %3s %s" % ("ssid", "rssi", "ch", "auth"))
     for ssid, bssid, ch, rssi, auth, hidden in nets[:25]:
         name = ssid.decode() if isinstance(ssid, bytes) else ssid
         out("%-32s %4d %3d %d" % (name or "<hidden>", rssi, ch, auth))
     out("total:", len(nets))
+
+
+def do_i2c(args):
+    if not args or args[0] == "scan":
+        out([hex(x) for x in stick.i2c_scan()])
+        return
+    if args[0] in ("r", "read") and len(args) >= 3:
+        addr = int(args[1], 0)
+        reg = int(args[2], 0)
+        n = int(args[3]) if len(args) > 3 else 1
+        out([hex(x) for x in stick.i2c_read(addr, reg, n)])
+        return
+    if args[0] in ("w", "write") and len(args) >= 4:
+        stick.i2c_write(int(args[1], 0), int(args[2], 0), int(args[3], 0))
+        out("ok")
+        return
+    out("usage: i2c [scan] | i2c r <addr> <reg> [n] | i2c w <addr> <reg> <val>")
 
 
 def run(line):
@@ -88,12 +165,33 @@ def run(line):
     elif cmd == "imu":
         do_imu(args)
     elif cmd == "wifi":
-        do_wifi()
+        do_wifi(args)
     elif cmd == "i2c":
-        out([hex(x) for x in stick.i2c_scan()])
+        do_i2c(args)
     elif cmd == "pins":
         a, b = stick.buttons()
         out("button A:", a, " button B:", b)
+    elif cmd == "pin":
+        if len(args) < 2:
+            out("usage: pin <gpio> in|0|1")
+        else:
+            out("gpio", args[0], "=", stick.pin(int(args[0]), args[1].lower()))
+    elif cmd == "adc":
+        if not args:
+            out("usage: adc <gpio>")
+        else:
+            raw, mv = stick.adc(int(args[0]))
+            out("adc", args[0], "raw", raw, "~%d mV" % mv)
+    elif cmd == "pwm":
+        if len(args) < 2:
+            out("usage: pwm <gpio> off | pwm <gpio> <freq> [duty]")
+        elif args[1] == "off":
+            stick.pwm(int(args[0]))
+            out("pwm off")
+        else:
+            duty = int(args[2]) if len(args) > 2 else 512
+            stick.pwm(int(args[0]), int(args[1]), duty)
+            out("pwm on", args[1], "Hz duty", duty)
     elif cmd == "led":
         what = args[0] if args else "blink"
         if what == "on":
@@ -110,6 +208,9 @@ def run(line):
         ms = int(args[1]) if len(args) > 1 else 120
         stick.buzz(f, ms)
         out("buzz", f, "Hz", ms, "ms")
+    elif cmd == "melody":
+        stick.melody()
+        out("♪")
     elif cmd == "cpu":
         import machine
 
@@ -129,12 +230,32 @@ def run(line):
         else:
             v = stick.rssi(" ".join(args))
             out(("%s: %d dBm" % (" ".join(args), v)) if v is not None else "not found: " + " ".join(args))
-    elif cmd == "melody":
-        stick.melody()
-        out("♪")
     elif cmd == "bench":
         dt, s = stick.bench()
         out("200k iterations in %d ms (%.2f us/iter)" % (dt / 1000, dt / 200000))
+    elif cmd == "log":
+        if args and args[0] == "clear":
+            for p in (LOG_PATH, "log.1"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            out("log cleared")
+        else:
+            n = int(args[0]) if args else 30
+            try:
+                with open(LOG_PATH) as f:
+                    lines = f.readlines()
+            except OSError:
+                lines = []
+            for item in lines[-n:]:
+                out(item.rstrip())
+            out("(%d entries)" % len(lines))
+    elif cmd == "deepsleep":
+        secs = int(args[0]) if args else 10
+        out("deepsleep", secs, "s")
+        time.sleep_ms(100)
+        stick.deepsleep(secs)
     elif cmd in ("reboot", "reset"):
         out("rebooting...")
         time.sleep_ms(100)
@@ -166,7 +287,7 @@ def main():
     if _wait_ctrl_c():
         return
     out("")
-    out("M5StickC headless shell | MicroPython " + "%d.%d.%d" % __import__("sys").implementation.version[:3])
+    out("M5StickC headless shell | MicroPython " + "%d.%d.%d" % sys.implementation.version[:3])
     out("type 'help' for commands, Ctrl-C to drop to REPL")
     out("")
     while True:
@@ -183,8 +304,11 @@ def main():
             continue
         try:
             run(line)
+            if line != "sample" and not line.startswith("log"):
+                _log(line)
         except Exception as e:
             out("error:", e)
+            _log("ERR " + line + " :: " + str(e))
 
 
 if __name__ == "__main__":

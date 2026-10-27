@@ -170,3 +170,97 @@ def bench():
         s = (s + i * i) & 0xFFFF
     dt = time.ticks_diff(time.ticks_us(), t0)
     return dt, s
+
+
+# ---------- full control ----------
+_PWM = {}
+
+
+def pin(num, mode):
+    p = machine.Pin(int(num), machine.Pin.IN if mode == "in" else machine.Pin.OUT)
+    if mode == "in":
+        return p.value()
+    v = 1 if mode in ("1", "on", "high") else 0
+    p.value(v)
+    return v
+
+
+def adc(num):
+    a = machine.ADC(machine.Pin(int(num)))
+    try:
+        a.atten(machine.ADC.ATTN_11DB)
+    except Exception:
+        pass
+    raw = a.read()
+    return raw, raw * 3300 // 4095
+
+
+def pwm(num, freq=None, duty=512):
+    num = int(num)
+    if num in _PWM:
+        try:
+            _PWM[num].deinit()
+        except Exception:
+            pass
+        del _PWM[num]
+    if freq is None:
+        machine.Pin(num, machine.Pin.OUT).value(0)
+        return "off"
+    _PWM[num] = machine.PWM(machine.Pin(num), freq=int(freq), duty=int(duty))
+    return "on"
+
+
+def i2c_read(addr, reg, n=1):
+    return list(I2C.readfrom_mem(int(addr), int(reg), int(n)))
+
+
+def i2c_write(addr, reg, val):
+    I2C.writeto_mem(int(addr), int(reg), bytes([int(val) & 0xFF]))
+    return True
+
+
+def wifi_status():
+    import network
+
+    w = network.WLAN(network.STA_IF)
+    if not w.active():
+        return {"active": False}
+    if not w.isconnected():
+        return {"active": True, "connected": False}
+    return {
+        "active": True,
+        "connected": True,
+        "ssid": w.config("essid"),
+        "rssi": w.status("rssi"),
+        "ip": w.ifconfig()[0],
+    }
+
+
+def wifi_connect(ssid, password, timeout=15):
+    import network
+
+    w = network.WLAN(network.STA_IF)
+    w.active(True)
+    if w.isconnected():
+        w.disconnect()
+    w.connect(ssid, password)
+    for _ in range(timeout * 10):
+        if w.isconnected():
+            return True
+        time.sleep_ms(100)
+    return False
+
+
+def wifi_disconnect():
+    import network
+
+    w = network.WLAN(network.STA_IF)
+    try:
+        w.disconnect()
+    except Exception:
+        pass
+    w.active(False)
+
+
+def deepsleep(seconds):
+    machine.deepsleep(int(seconds * 1000))

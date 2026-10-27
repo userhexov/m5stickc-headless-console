@@ -54,6 +54,10 @@
   .net .r{color:var(--dim);text-align:right}
   .events{max-height:190px;overflow:auto;display:flex;flex-direction:column;gap:4px;font-size:12px}
   .events div{color:#9fb0c3}
+  .events .motion{color:#ff8a84}
+  .events .error{color:#ffd60a}
+  .events .record{color:#b6ff4d}
+  .events .button{color:#4dd2ff}
   .events time{color:var(--dim);margin-right:8px}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12px}
   .kv b{color:var(--dim);font-weight:400}
@@ -112,6 +116,8 @@
       <button onclick="cmd('bench')">bench</button>
       <button onclick="cmd('bat')">battery</button>
       <button onclick="cmd('imu 3')">imu x3</button>
+      <button onclick="record(10)">record 10s</button>
+      <button onclick="devlog()">dev log</button>
       <button class="accent" onclick="cmd('reboot')">reboot</button>
     </div>
     <pre id="ctlout"></pre>
@@ -211,7 +217,7 @@ function renderWifi(nets){
   }).join('');
 }
 function renderEvents(evs){
-  $('events').innerHTML = evs.map(e=>`<div><time>${e.t}</time>${e.text}</div>`).join('');
+  $('events').innerHTML = evs.map(e=>`<div class="${e.kind||''}"><time>${e.t}</time>${e.text}</div>`).join('');
 }
 
 async function cmd(c){
@@ -219,6 +225,20 @@ async function cmd(c){
   const r = await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:c})});
   const j = await r.json();
   $('ctlout').textContent = '> ' + c + '\\n' + (j.output||'');
+}
+async function record(sec){
+  $('ctlout').textContent = 'recording ' + sec + 's...';
+  const r = await fetch('/api/record',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:sec})});
+  const j = await r.json();
+  $('ctlout').textContent = j.ok
+    ? ('saved ' + j.name + '\nrows ' + j.rows + '   mean ' + j.mean_g + ' g   spread ' + j.spread_g + ' g\n' + j.path)
+    : ('error: ' + j.error);
+}
+async function devlog(){
+  $('ctlout').textContent = '...';
+  const r = await fetch('/api/device-log?n=20');
+  const j = await r.json();
+  $('ctlout').textContent = j.output || j.error || '';
 }
 async function term(){
   const v = $('cmdline').value.trim(); if(!v) return;
