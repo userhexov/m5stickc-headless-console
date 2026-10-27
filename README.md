@@ -25,7 +25,7 @@
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/<you>/m5stickc-headless-console.git
+git clone https://github.com/userhexov/m5stickc-headless-console.git
 cd m5stickc-headless-console
 
 # 1. прошить MicroPython (стирает flash!)
