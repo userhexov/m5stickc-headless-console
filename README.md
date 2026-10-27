@@ -125,7 +125,7 @@ docs/            подробная документация
 | [03-shell](docs/03-shell.md) | команды оболочки и их реализация |
 | [04-dashboard](docs/04-dashboard.md) | API панели, worker, SSE, сервис |
 | [05-mcp](docs/05-mcp.md) | подключение к opencode, все 37 инструментов |
-| [06-pitfalls](docs/06-pitfalls.md) | 9 реальных багов и их причины |
+| [06-pitfalls](docs/06-pitfalls.md) | 10 реальных багов и их причины |
 | [07-roadmap](docs/07-roadmap.md) | presence, RSSI, CSI, автоматизации |
 | [08-use-cases](docs/08-use-cases.md) | 7 кейсов с настоящими логами |
 | [09-logging](docs/09-logging.md) | три слоя логов, форматы, ротация |
@@ -141,6 +141,7 @@ docs/            подробная документация
 7. HTTP-ответ с `dict` вместо `json.dumps` → битый Content-Length.
 8. Хвост промпта `esp32> ` в ответе → парсер ломается на `float`.
 9. `Pin.value(1)` возвращает `None` → нельзя возвращать результат сеттера.
+10. FTDI иногда теряет первые байты `sample` → один немедленный повтор.
 
 Подробности и код — в [docs/06-pitfalls.md](docs/06-pitfalls.md).
 

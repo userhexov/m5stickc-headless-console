@@ -198,27 +198,43 @@ class Worker(threading.Thread):
             fut["ev"].set()
 
     def _sample(self):
-        try:
-            raw = self._write_read(SAMPLE, timeout=6)
+        raw = ""
+        vals = None
+        serial_error = None
+        # The FTDI bridge occasionally drops the first bytes of a short line
+        # ("sample" -> "smple"). One immediate retry hides that without
+        # touching the 5 Hz cadence.
+        for _attempt in (1, 2):
+            try:
+                raw = self._write_read(SAMPLE, timeout=6)
+            except Exception as e:
+                serial_error = e
+                self._close()
+                break
             parts = [p for p in raw.strip().split(",") if p]
-            if len(parts) < 13:
-                self.fail += 1
-                if self.fail in (1, 10, 100):
-                    log_event("bad sample (%d): %r" % (self.fail, raw[:60]), kind="error")
-                time.sleep(0.3)
+            if len(parts) >= 13:
+                try:
+                    vals = [float(p) for p in parts[:13]]
+                    break
+                except ValueError:
+                    pass
+
+        if vals is None:
+            if serial_error is not None:
+                if self.paused_until > time.time():
+                    time.sleep(0.2)
+                    return
+                with SLOCK:
+                    STATE["online"] = False
+                log_event("serial error: %s" % serial_error, kind="error")
+                time.sleep(0.5)
                 return
-            self.fail = 0
-            vals = [float(p) for p in parts[:13]]
-        except Exception as e:
-            self._close()
-            if self.paused_until > time.time():
-                time.sleep(0.2)
-                return
-            with SLOCK:
-                STATE["online"] = False
-            log_event("serial error: %s" % e, kind="error")
-            time.sleep(0.5)
+            self.fail += 1
+            if self.fail in (1, 10, 100):
+                log_event("bad sample (%d): %r" % (self.fail, raw[:60]), kind="error")
+            time.sleep(0.2)
             return
+        self.fail = 0
 
         imu = vals[0:6]
         acc = imu[0:3]
